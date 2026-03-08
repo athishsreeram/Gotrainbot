@@ -15,22 +15,22 @@ InlineQueryHandler,
 ContextTypes,
 )
 
-logging.basicConfig(format=”%(asctime)s [%(levelname)s] %(message)s”, level=logging.INFO)
+logging.basicConfig(format="%(asctime)s [%(levelname)s] %(message)s", level=logging.INFO)
 logger = logging.getLogger(**name**)
 
-BASE_URL = “https://www.gotracker.ca/GOTracker/web/GODataAPIProxy.svc”
+BASE_URL = "https://www.gotracker.ca/GOTracker/web/GODataAPIProxy.svc"
 
 LINE_CODES = {
-“MO”: “Milton”,
-“LW”: “Lakeshore West”,
-“LE”: “Lakeshore East”,
-“ST”: “Stouffville”,
-“RH”: “Richmond Hill”,
-“BR”: “Barrie”,
-“KI”: “Kitchener”,
+"MO": "Milton",
+"LW": "Lakeshore West",
+"LE": "Lakeshore East",
+"ST": "Stouffville",
+"RH": "Richmond Hill",
+"BR": "Barrie",
+"KI": "Kitchener",
 }
 
-USER_DB = Path(“users.json”)
+USER_DB = Path("users.json")
 
 def load_users():
 if USER_DB.exists():
@@ -53,37 +53,37 @@ users[uid] = {**users.get(uid, {}), **data}
 save_users(users)
 
 def fetch_departures(station_cd):
-url = BASE_URL + “/StationStatusJSON/Service/StationCd/Lang/GT/” + station_cd + “/EN”
+url = BASE_URL + "/StationStatusJSON/Service/StationCd/Lang/GT/" + station_cd + "/EN"
 try:
 resp = requests.get(url, timeout=10)
 resp.raise_for_status()
 return resp.json()
 except Exception as e:
-logger.error(“API error for %s: %s”, station_cd, e)
+logger.error("API error for %s: %s", station_cd, e)
 return None
 
 def parse_trips(data):
 try:
-inner = data.get(“d”) or data.get(“ReturnStringValue”, {}).get(“Data”, “”)
+inner = data.get("d") or data.get("ReturnStringValue", {}).get("Data", "")
 if isinstance(inner, str):
 inner = json.loads(inner)
 return (
-inner.get(“Trips”)
-or inner.get(“trips”)
-or inner.get(“StationStatusJSON”, {}).get(“Trips”)
+inner.get("Trips")
+or inner.get("trips")
+or inner.get("StationStatusJSON", {}).get("Trips")
 or []
 )
 except Exception:
 return []
 
-def format_message(station_cd, header_suffix=””):
+def format_message(station_cd, header_suffix=""):
 label = LINE_CODES.get(station_cd.upper(), station_cd.upper())
 data = fetch_departures(station_cd.upper())
 if data is None:
-return “Could not reach GO Tracker. Try again shortly.”
+return "Could not reach GO Tracker. Try again shortly."
 trips = parse_trips(data)
 if not trips:
-return “*GO Train - “ + label + “ line*\n\nNo upcoming departures right now.”
+return "*GO Train - " + label + " line*\n\nNo upcoming departures right now."
 
 ```
 lines = [
@@ -110,88 +110,88 @@ return "\n".join(lines)
 
 async def send_alert(context):
 job = context.job
-user_id   = job.data[“user_id”]
-chat_id   = job.data[“chat_id”]
-line_code = job.data[“line_code”]
-msg = format_message(line_code, header_suffix=” - Daily Alert”)
-await context.bot.send_message(chat_id=chat_id, text=msg, parse_mode=“Markdown”)
+user_id   = job.data["user_id"]
+chat_id   = job.data["chat_id"]
+line_code = job.data["line_code"]
+msg = format_message(line_code, header_suffix=" - Daily Alert")
+await context.bot.send_message(chat_id=chat_id, text=msg, parse_mode="Markdown")
 
 async def cmd_start(update, context):
 bot_username = context.bot.username
 msg = (
-“*Welcome to GO Train Departures Bot!*\n\n”
-“Quick start:\n”
-“1. Save your line: /setfav MO\n”
-“2. Get departures anytime: /myfav\n”
-“3. Set a daily alert: /setalert MO 08:00\n”
-“4. Use inline anywhere: @” + bot_username + “ MO\n\n”
-“Line codes:\n”
-+ “\n”.join(”  “ + k + “ - “ + v for k, v in LINE_CODES.items())
-+ “\n\n/help for full command list”
+"*Welcome to GO Train Departures Bot!*\n\n"
+"Quick start:\n"
+"1. Save your line: /setfav MO\n"
+"2. Get departures anytime: /myfav\n"
+"3. Set a daily alert: /setalert MO 08:00\n"
+"4. Use inline anywhere: @" + bot_username + " MO\n\n"
+"Line codes:\n"
++ "\n".join("  " + k + " - " + v for k, v in LINE_CODES.items())
++ "\n\n/help for full command list"
 )
-await update.message.reply_text(msg, parse_mode=“Markdown”)
+await update.message.reply_text(msg, parse_mode="Markdown")
 
 async def cmd_help(update, context):
 bot_username = context.bot.username
 msg = (
-“*GO Train Bot - Commands*\n\n”
-“/go MO - Live departures for a line\n”
-“/setfav MO - Save your favourite line\n”
-“/myfav - Get your favourite line departures\n”
-“/setalert MO 08:00 - Daily alert at 8am\n”
-“/cancelalert - Cancel your daily alert\n”
-“/mystatus - View your saved settings\n”
-“/lines - All line codes\n\n”
-“Inline (works in any chat):\n”
-“@” + bot_username + “ MO - Share departures inline”
+"*GO Train Bot - Commands*\n\n"
+"/go MO - Live departures for a line\n"
+"/setfav MO - Save your favourite line\n"
+"/myfav - Get your favourite line departures\n"
+"/setalert MO 08:00 - Daily alert at 8am\n"
+"/cancelalert - Cancel your daily alert\n"
+"/mystatus - View your saved settings\n"
+"/lines - All line codes\n\n"
+"Inline (works in any chat):\n"
+"@" + bot_username + " MO - Share departures inline"
 )
-await update.message.reply_text(msg, parse_mode=“Markdown”)
+await update.message.reply_text(msg, parse_mode="Markdown")
 
 async def cmd_lines(update, context):
-text = “*GO Train Line Codes:*\n\n” + “\n”.join(k + “ - “ + v for k, v in LINE_CODES.items())
-await update.message.reply_text(text, parse_mode=“Markdown”)
+text = "*GO Train Line Codes:*\n\n" + "\n".join(k + " - " + v for k, v in LINE_CODES.items())
+await update.message.reply_text(text, parse_mode="Markdown")
 
 async def cmd_go(update, context):
-code = context.args[0].upper() if context.args else “MO”
+code = context.args[0].upper() if context.args else "MO"
 if code not in LINE_CODES:
-await update.message.reply_text(“Unknown line “ + code + “. Use /lines to see options.”)
+await update.message.reply_text("Unknown line " + code + ". Use /lines to see options.")
 return
-msg = await update.message.reply_text(“Fetching live departures…”)
-await msg.edit_text(format_message(code), parse_mode=“Markdown”)
+msg = await update.message.reply_text("Fetching live departures…")
+await msg.edit_text(format_message(code), parse_mode="Markdown")
 
 async def cmd_setfav(update, context):
 if not context.args:
-await update.message.reply_text(“Usage: /setfav MO\n\nUse /lines to see all codes.”)
+await update.message.reply_text("Usage: /setfav MO\n\nUse /lines to see all codes.")
 return
 code = context.args[0].upper()
 if code not in LINE_CODES:
-await update.message.reply_text(“Unknown line “ + code + “. Use /lines.”)
+await update.message.reply_text("Unknown line " + code + ". Use /lines.")
 return
-set_user(update.effective_user.id, {“favourite”: code})
-await update.message.reply_text(“Favourite saved: “ + LINE_CODES[code] + “ (” + code + “)\n\nUse /myfav anytime.”)
+set_user(update.effective_user.id, {"favourite": code})
+await update.message.reply_text("Favourite saved: " + LINE_CODES[code] + " (" + code + ")\n\nUse /myfav anytime.")
 
 async def cmd_myfav(update, context):
 user = get_user(update.effective_user.id)
-fav = user.get(“favourite”)
+fav = user.get("favourite")
 if not fav:
-await update.message.reply_text(“No favourite saved yet.\n\nUse /setfav MO to save one.”)
+await update.message.reply_text("No favourite saved yet.\n\nUse /setfav MO to save one.")
 return
-msg = await update.message.reply_text(“Fetching “ + LINE_CODES[fav] + “ departures…”)
-await msg.edit_text(format_message(fav), parse_mode=“Markdown”)
+msg = await update.message.reply_text("Fetching " + LINE_CODES[fav] + " departures…")
+await msg.edit_text(format_message(fav), parse_mode="Markdown")
 
 async def cmd_setalert(update, context):
 if len(context.args) < 2:
-await update.message.reply_text(“Usage: /setalert MO 08:00\n\nSends daily departures at that time.”)
+await update.message.reply_text("Usage: /setalert MO 08:00\n\nSends daily departures at that time.")
 return
 code = context.args[0].upper()
 time_str = context.args[1]
 if code not in LINE_CODES:
-await update.message.reply_text(“Unknown line “ + code + “. Use /lines.”)
+await update.message.reply_text("Unknown line " + code + ". Use /lines.")
 return
 try:
-alert_time = datetime.strptime(time_str, “%H:%M”).time()
+alert_time = datetime.strptime(time_str, "%H:%M").time()
 except ValueError:
-await update.message.reply_text(“Invalid time. Use HH:MM format e.g. 08:00”)
+await update.message.reply_text("Invalid time. Use HH:MM format e.g. 08:00")
 return
 
 ```
@@ -216,29 +216,29 @@ await update.message.reply_text(
 
 async def cmd_cancelalert(update, context):
 user_id = update.effective_user.id
-job_name = “alert_” + str(user_id)
+job_name = "alert_" + str(user_id)
 jobs = context.job_queue.get_jobs_by_name(job_name)
 if not jobs:
-await update.message.reply_text(“You do not have an active alert.”)
+await update.message.reply_text("You do not have an active alert.")
 return
 for job in jobs:
 job.schedule_removal()
-set_user(user_id, {“alert_line”: None, “alert_time”: None})
-await update.message.reply_text(“Daily alert cancelled.”)
+set_user(user_id, {"alert_line": None, "alert_time": None})
+await update.message.reply_text("Daily alert cancelled.")
 
 async def cmd_mystatus(update, context):
 user = get_user(update.effective_user.id)
-fav        = user.get(“favourite”)
-alert_line = user.get(“alert_line”)
-alert_time = user.get(“alert_time”)
-fav_str    = fav + “ - “ + LINE_CODES.get(fav, “?”) if fav else “Not set”
-alert_str  = alert_line + “ at “ + alert_time + “ daily” if alert_line and alert_time else “Not set”
+fav        = user.get("favourite")
+alert_line = user.get("alert_line")
+alert_time = user.get("alert_time")
+fav_str    = fav + " - " + LINE_CODES.get(fav, "?") if fav else "Not set"
+alert_str  = alert_line + " at " + alert_time + " daily" if alert_line and alert_time else "Not set"
 await update.message.reply_text(
-“*Your GO Train Bot settings:*\n\n”
-“Favourite line: “ + fav_str + “\n”
-“Daily alert: “ + alert_str + “\n\n”
-“Change with /setfav or /setalert”,
-parse_mode=“Markdown”,
+"*Your GO Train Bot settings:*\n\n"
+"Favourite line: " + fav_str + "\n"
+"Daily alert: " + alert_str + "\n\n"
+"Change with /setfav or /setalert",
+parse_mode="Markdown",
 )
 
 async def inline_query(update, context):
@@ -275,9 +275,9 @@ await update.inline_query.answer(results, cache_time=30)
 ```
 
 def main():
-token = os.environ.get(“BOT_TOKEN”)
+token = os.environ.get("BOT_TOKEN")
 if not token:
-print(“ERROR: Set BOT_TOKEN environment variable.”)
+print("ERROR: Set BOT_TOKEN environment variable.")
 sys.exit(1)
 
 ```
@@ -297,5 +297,5 @@ logger.info("Bot running!")
 app.run_polling(allowed_updates=["message", "inline_query"])
 ```
 
-if **name** == “**main**”:
+if **name** == "**main**":
 main()
