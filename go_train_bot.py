@@ -1,97 +1,73 @@
 import os
 import sys
-import json
 import logging
 import requests
 from datetime import datetime
-from uuid import uuid4
-from pathlib import Path
+from cachetools import TTLCache
 
-from telegram import Update, InlineQueryResultArticle, InputTextMessageContent
-from telegram.ext import (
-    ApplicationBuilder,
-    CommandHandler,
-    InlineQueryHandler,
-    ContextTypes,
-)
+from telegram import Update
+from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 
-# ---------------- LOGGING ---------------- #
+# ---------------- LOGGING ----------------
 
 logging.basicConfig(
-    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+    format="%(asctime)s | %(levelname)s | %(message)s",
     level=logging.INFO,
     handlers=[logging.StreamHandler(sys.stdout)],
 )
 
 logger = logging.getLogger(__name__)
 
-# ---------------- CONFIG ---------------- #
+# ---------------- CONFIG ----------------
 
 BASE_URL = "https://www.gotracker.ca/GOTracker/web/GODataAPIProxy.svc"
 
-LINE_CODES = {
-    "MO": "Milton",
-    "LW": "Lakeshore West",
-    "LE": "Lakeshore East",
-    "ST": "Stouffville",
-    "RH": "Richmond Hill",
-    "BR": "Barrie",
-    "KI": "Kitchener",
+STATIONS = {
+    "union": "UN",
+    "milton": "MI",
+    "oakville": "OA",
+    "burlington": "BU",
+    "portcredit": "PC",
+    "clarkson": "CL",
 }
 
-USER_DB = Path("users.json")
+cache = TTLCache(maxsize=100, ttl=30)
 
-# ---------------- USER STORAGE ---------------- #
-
-def load_users():
-    if USER_DB.exists():
-        try:
-            return json.loads(USER_DB.read_text())
-        except Exception:
-            return {}
-    return {}
+# ---------------- API ----------------
 
 
-def save_users(users):
-    USER_DB.write_text(json.dumps(users, indent=2))
+def fetch_station(station):
 
+    if station in cache:
+        return cache[station]
 
-def get_user(user_id):
-    return load_users().get(str(user_id), {})
+    url = f"{BASE_URL}/StationStatusJSON/Service/StationCd/Lang/GT/{station}/EN"
 
-
-def set_user(user_id, data):
-    users = load_users()
-    uid = str(user_id)
-
-    users[uid] = {**users.get(uid, {}), **data}
-
-    save_users(users)
-
-# ---------------- GO API ---------------- #
-
-def fetch_departures(station_cd):
-
-    url = f"{BASE_URL}/StationStatusJSON/Service/StationCd/Lang/GT/{station_cd}/EN"
-
-    logger.info(f"Calling GO API for {station_cd}")
-    logger.info(url)
+    headers = {
+        "User-Agent": "Mozilla/5.0",
+        "Referer": "https://www.gotracker.ca/",
+    }
 
     try:
-        resp = requests.get(url, timeout=10)
 
-        logger.info(f"API status: {resp.status_code}")
+        logger.info(f"Calling GO API {station}")
 
-        resp.raise_for_status()
+        r = requests.get(url, headers=headers, timeout=10)
 
-        data = resp.json()
+        logger.info(f"Status {r.status_code}")
 
-        logger.info("API response received")
+        r.raise_for_status()
+
+        data = r.json()
+
+        cache[station] = data
 
         return data
 
     except Exception as e:
-        logger.exception("GO API ERROR")
+
+        logger.exception("API error")
+
         return None
 
 
@@ -99,217 +75,136 @@ def parse_trips(data):
 
     try:
 
-        inner = data.get("d") or data.get("ReturnStringValue", {}).get("Data", "")
+        inner = data.get("d")
 
         if isinstance(inner, str):
+            import json
+
             inner = json.loads(inner)
 
-        trips = (
-            inner.get("Trips")
-            or inner.get("trips")
-            or inner.get("StationStatusJSON", {}).get("Trips")
-            or []
-        )
-
-        logger.info(f"Trips parsed: {len(trips)}")
-
-        return trips
+        return inner.get("Trips", [])
 
     except Exception:
-        logger.exception("Trip parsing failed")
+
+        logger.exception("Parse failed")
+
         return []
 
-# ---------------- MESSAGE FORMAT ---------------- #
 
-def format_message(station_cd, header_suffix=""):
+# ---------------- FORMAT ----------------
 
-    logger.info(f"Formatting message for {station_cd}")
 
-    label = LINE_CODES.get(station_cd.upper(), station_cd.upper())
-
-    data = fetch_departures(station_cd.upper())
-
-    if data is None:
-        return "⚠️ Could not reach GO Tracker API."
-
-    trips = parse_trips(data)
+def format_trips(station_name, trips):
 
     if not trips:
-        return f"*GO Train - {label} line*\n\nNo upcoming departures."
+        return f"No upcoming trains for {station_name}"
 
-    lines = [
-        f"*GO Train - {label} line*{header_suffix}",
-        f"_Union Station - {datetime.now().strftime('%H:%M')}_\n",
-    ]
+    msg = f"🚆 GO Departures — {station_name.title()}\n\n"
 
-    for trip in trips[:8]:
+    for trip in trips[:5]:
 
-        dest = trip.get("TripDestName") or "?"
-        sched = trip.get("ScheduledTime") or "?"
-        actual = trip.get("ActualTime") or sched
-        platform = trip.get("Platform") or "?"
-        status = trip.get("Status") or "On time"
-        train = trip.get("TripNumber") or ""
+        dest = trip.get("TripDestName", "?")
 
-        delay = f" _(was {sched})_" if actual != sched else ""
+        time = trip.get("ActualTime") or trip.get("ScheduledTime")
+
+        platform = trip.get("Platform", "?")
+
+        status = trip.get("Status", "On time")
 
         if "cancel" in status.lower():
             emoji = "🔴"
-        elif "on time" in status.lower():
+        elif "on" in status.lower():
             emoji = "🟢"
         else:
             emoji = "🟡"
 
-        lines.append(
-            f"{emoji} *{actual}*{delay} to {dest}\n"
-            f"   #{train} - Platform {platform} - {status}"
-        )
+        msg += f"{emoji} {time} → {dest}\nPlatform {platform}\n\n"
 
-    lines.append("\n_gotracker.ca_")
-
-    return "\n".join(lines)
-
-# ---------------- COMMANDS ---------------- #
-
-async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-
-    logger.info("Command /start received")
-
-    bot_username = context.bot.username
-
-    msg = (
-        "*GO Train Departures Bot*\n\n"
-        "Commands:\n"
-        "/go MO - Get live departures\n"
-        "/lines - Show line codes\n\n"
-        f"Inline usage:\n@{bot_username} MO\n\n"
-        "Available lines:\n"
-        + "\n".join(f"{k} - {v}" for k, v in LINE_CODES.items())
-    )
-
-    await update.message.reply_text(msg, parse_mode="Markdown")
+    return msg
 
 
-async def cmd_lines(update: Update, context: ContextTypes.DEFAULT_TYPE):
-
-    logger.info("Command /lines received")
-
-    text = "*GO Train Line Codes*\n\n"
-
-    text += "\n".join(f"{k} - {v}" for k, v in LINE_CODES.items())
-
-    await update.message.reply_text(text, parse_mode="Markdown")
+# ---------------- COMMANDS ----------------
 
 
-async def cmd_go(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
+    msg = """
+🚆 GO Train Bot
+
+Commands
+
+/go union
+/go milton
+
+/stations
+"""
+
+    await update.message.reply_text(msg)
+
+
+async def stations(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
+    text = "Available stations:\n\n"
+
+    for s in STATIONS:
+        text += f"{s}\n"
+
+    await update.message.reply_text(text)
+
+
+async def go(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     try:
 
-        logger.info("Command /go received")
-
-        code = context.args[0].upper() if context.args else "MO"
-
-        logger.info(f"Line requested: {code}")
-
-        if code not in LINE_CODES:
-
-            logger.warning("Invalid line")
-
-            await update.message.reply_text(
-                "Unknown line. Use /lines."
-            )
-
+        if not context.args:
+            await update.message.reply_text("Usage: /go union")
             return
 
-        msg = await update.message.reply_text("Fetching departures...")
+        station_name = context.args[0].lower()
 
-        result = format_message(code)
+        if station_name not in STATIONS:
+            await update.message.reply_text("Unknown station")
+            return
 
-        logger.info("Sending formatted message")
+        station_code = STATIONS[station_name]
 
-        await msg.edit_text(result, parse_mode="Markdown")
+        await update.message.reply_text("Fetching trains...")
+
+        data = fetch_station(station_code)
+
+        trips = parse_trips(data)
+
+        msg = format_trips(station_name, trips)
+
+        await update.message.reply_text(msg)
 
     except Exception:
 
-        logger.exception("Error in /go command")
+        logger.exception("Command failed")
 
-        await update.message.reply_text("⚠️ Error fetching departures.")
+        await update.message.reply_text("Error fetching trains")
 
-# ---------------- INLINE ---------------- #
 
-async def inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# ---------------- MAIN ----------------
 
-    query = update.inline_query.query.strip().upper()
-
-    logger.info(f"Inline query: {query}")
-
-    results = []
-
-    if query and query not in LINE_CODES:
-
-        results.append(
-            InlineQueryResultArticle(
-                id=str(uuid4()),
-                title="Unknown line code",
-                description="Try: " + " ".join(LINE_CODES.keys()),
-                input_message_content=InputTextMessageContent(
-                    "Unknown line code."
-                ),
-            )
-        )
-
-        await update.inline_query.answer(results)
-
-        return
-
-    lines_to_show = {query: LINE_CODES[query]} if query else LINE_CODES
-
-    for code, name in lines_to_show.items():
-
-        results.append(
-            InlineQueryResultArticle(
-                id=str(uuid4()),
-                title=f"{name} ({code})",
-                description="Share live departures",
-                input_message_content=InputTextMessageContent(
-                    format_message(code),
-                    parse_mode="Markdown",
-                ),
-            )
-        )
-
-    await update.inline_query.answer(results)
-
-# ---------------- ERROR HANDLER ---------------- #
-
-async def error_handler(update, context):
-
-    logger.exception("Telegram error", exc_info=context.error)
-
-# ---------------- MAIN ---------------- #
 
 def main():
 
     token = os.environ.get("BOT_TOKEN")
 
     if not token:
-        print("ERROR: BOT_TOKEN not set")
+        print("BOT_TOKEN missing")
         sys.exit(1)
-
-    logger.info("Starting bot")
 
     app = ApplicationBuilder().token(token).build()
 
-    app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CommandHandler("lines", cmd_lines))
-    app.add_handler(CommandHandler("go", cmd_go))
-    app.add_handler(InlineQueryHandler(inline_query))
-
-    app.add_error_handler(error_handler)
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("stations", stations))
+    app.add_handler(CommandHandler("go", go))
 
     logger.info("Bot running")
 
-    app.run_polling(allowed_updates=["message", "inline_query"])
+    app.run_polling()
 
 
 if __name__ == "__main__":
