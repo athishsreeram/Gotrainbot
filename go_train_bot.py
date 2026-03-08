@@ -1,50 +1,25 @@
-# #!/usr/bin/env python3
-“””
-GO Train Union Station Departures — Inline Telegram Bot
-
-Anyone can use this in ANY chat by typing:
-@YourBot MO        → Milton line
-@YourBot LE        → Lakeshore East
-@YourBot BR        → Barrie
-@YourBot           → shows all line options to pick from
-
-Setup:
-pip install python-telegram-bot requests
-
-Also enable inline mode in @BotFather:
-/setinline → @YourBot → set placeholder text e.g. “MO, LE, BR…”
-
-Run:
-BOT_TOKEN=<your_token> python go_train_bot.py
-“””
-
 import os
 import sys
+import json
 import logging
 import requests
-import json
 from datetime import datetime
 from uuid import uuid4
+from pathlib import Path
 
-from telegram import (
-Update,
-InlineQueryResultArticle,
-InputTextMessageContent,
-)
+from telegram import Update, InlineQueryResultArticle, InputTextMessageContent
 from telegram.ext import (
 ApplicationBuilder,
 CommandHandler,
 InlineQueryHandler,
 ContextTypes,
+JobQueue,
 )
 
-logging.basicConfig(
-format=”%(asctime)s [%(levelname)s] %(message)s”,
-level=logging.INFO,
-)
+logging.basicConfig(format=”%(asctime)s [%(levelname)s] %(message)s”, level=logging.INFO)
 logger = logging.getLogger(**name**)
 
-# ── Config ────────────────────────────────────────────────────────────────────
+# ── Constants ─────────────────────────────────────────────────────────────────
 
 BASE_URL = “https://www.gotracker.ca/GOTracker/web/GODataAPIProxy.svc”
 
@@ -58,10 +33,35 @@ LINE_CODES = {
 “KI”: “Kitchener”,
 }
 
+USER_DB = Path(“users.json”)  # simple file-based store; swap for SQLite/Redis at scale
+
+# ── User Store ────────────────────────────────────────────────────────────────
+
+def load_users() -> dict:
+if USER_DB.exists():
+try:
+return json.loads(USER_DB.read_text())
+except Exception:
+return {}
+return {}
+
+def save_users(users: dict):
+USER_DB.write_text(json.dumps(users, indent=2))
+
+def get_user(user_id: int) -> dict:
+users = load_users()
+return users.get(str(user_id), {})
+
+def set_user(user_id: int, data: dict):
+users = load_users()
+uid = str(user_id)
+users[uid] = {**users.get(uid, {}), **data}
+save_users(users)
+
 # ── GO Tracker API ────────────────────────────────────────────────────────────
 
-def fetch_departures(station_cd: str, lang: str = “EN”) -> dict | None:
-url = f”{BASE_URL}/StationStatusJSON/Service/StationCd/Lang/GT/{station_cd}/{lang}”
+def fetch_departures(station_cd: str) -> dict | None:
+url = f”{BASE_URL}/StationStatusJSON/Service/StationCd/Lang/GT/{station_cd}/EN”
 try:
 resp = requests.get(url, timeout=10)
 resp.raise_for_status()
@@ -76,32 +76,26 @@ inner = data.get(“d”) or data.get(“ReturnStringValue”, {}).get(“Data�
 if isinstance(inner, str):
 inner = json.loads(inner)
 return (
-inner.get(“Trips”)
-or inner.get(“trips”)
-or inner.get(“StationStatusJSON”, {}).get(“Trips”)
-or []
+inner.get(“Trips”) or inner.get(“trips”)
+or inner.get(“StationStatusJSON”, {}).get(“Trips”) or []
 )
 except Exception:
 return []
 
-def format_message(station_cd: str) -> str:
+def format_message(station_cd: str, header_suffix: str = “”) -> str:
 label = LINE_CODES.get(station_cd.upper(), station_cd.upper())
 data = fetch_departures(station_cd.upper())
+if data is None:
+return “❌ Could not reach GO Tracker. Try again shortly.”
+trips = parse_trips(data)
+if not trips:
+return f”🚂 *GO Train — {label} line*\n\nNo upcoming departures right now.”
 
 ```
-if data is None:
-    return "❌ Could not reach GO Tracker. Try again in a moment."
-
-trips = parse_trips(data)
-
-if not trips:
-    return f"🚂 *GO Train — {label} line*\n\nNo upcoming departures right now."
-
 lines = [
-    f"🚂 *GO Train — {label} line*",
-    f"_Union Station departures · {datetime.now().strftime('%H:%M')}_\n",
+    f"🚂 *GO Train — {label} line*{header_suffix}",
+    f"_Union Station · {datetime.now().strftime('%H:%M')}_\n",
 ]
-
 for trip in trips[:8]:
     dest        = trip.get("TripDestName") or trip.get("destination") or "?"
     sched_time  = trip.get("ScheduledTime") or trip.get("scheduledTime") or "?"
@@ -109,20 +103,185 @@ for trip in trips[:8]:
     platform    = trip.get("Platform") or trip.get("platform") or "?"
     status      = trip.get("Status") or trip.get("status") or "On time"
     train_num   = trip.get("TripNumber") or trip.get("tripNumber") or ""
-
-    delay_str = f" _(was {sched_time})_" if actual_time != sched_time else ""
-    emoji = "🟢" if "on time" in status.lower() else "🔴" if "cancel" in status.lower() else "🟡"
-
+    delay_str   = f" _(was {sched_time})_" if actual_time != sched_time else ""
+    emoji       = "🟢" if "on time" in status.lower() else "🔴" if "cancel" in status.lower() else "🟡"
     lines.append(
         f"{emoji} *{actual_time}*{delay_str} → {dest}\n"
         f"   `#{train_num}` · Platform {platform} · {status}"
     )
-
 lines.append("\n_[gotracker.ca](https://www.gotracker.ca)_")
 return "\n".join(lines)
 ```
 
-# ── Inline Query Handler ──────────────────────────────────────────────────────
+# ── Scheduled Alert Job ───────────────────────────────────────────────────────
+
+async def send_alert(context: ContextTypes.DEFAULT_TYPE):
+“”“Called by JobQueue at the user’s chosen time every day.”””
+job = context.job
+user_id   = job.data[“user_id”]
+chat_id   = job.data[“chat_id”]
+line_code = job.data[“line_code”]
+msg = format_message(line_code, header_suffix=” — ⏰ Daily Alert”)
+await context.bot.send_message(
+chat_id=chat_id,
+text=msg,
+parse_mode=“Markdown”,
+disable_web_page_preview=True,
+)
+
+# ── Command Handlers ──────────────────────────────────────────────────────────
+
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+bot_username = context.bot.username
+await update.message.reply_text(
+f”👋 *Welcome to GO Train Departures Bot!*\n\n”
+f”*Quick start:*\n”
+f”1️⃣ Save your line: `/setfav MO`\n”
+f”2️⃣ Get departures anytime: `/myfav`\n”
+f”3️⃣ Set a daily alert: `/setalert MO 08:00`\n”
+f”4️⃣ Use inline anywhere: `@{bot_username} MO`\n\n”
+f”*Line codes:*\n”
++ “\n”.join(f”  `{k}` — {v}” for k, v in LINE_CODES.items())
++ “\n\n`/help` for full command list”,
+parse_mode=“Markdown”,
+)
+
+async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
+bot_username = context.bot.username
+await update.message.reply_text(
+f”*GO Train Bot — Commands*\n\n”
+f”`/go MO` — Live departures for a line\n”
+f”`/setfav MO` — Save your favourite line\n”
+f”`/myfav` — Get your favourite line departures\n”
+f”`/setalert MO 08:00` — Daily alert at 8am\n”
+f”`/cancelalert` — Cancel your daily alert\n”
+f”`/mystatus` — View your saved settings\n”
+f”`/lines` — All line codes\n\n”
+f”*Inline (works in any chat):*\n”
+f”`@{bot_username} MO` — Share departures inline\n”
+f”`@{bot_username}` — Browse all lines”,
+parse_mode=“Markdown”,
+)
+
+async def cmd_lines(update: Update, context: ContextTypes.DEFAULT_TYPE):
+text = “*GO Train Line Codes:*\n\n” + “\n”.join(f”`{k}` — {v}” for k, v in LINE_CODES.items())
+await update.message.reply_text(text, parse_mode=“Markdown”)
+
+async def cmd_go(update: Update, context: ContextTypes.DEFAULT_TYPE):
+code = context.args[0].upper() if context.args else “MO”
+if code not in LINE_CODES:
+await update.message.reply_text(f”❓ Unknown line `{code}`. Use /lines to see options.”, parse_mode=“Markdown”)
+return
+msg = await update.message.reply_text(“🔄 Fetching live departures…”)
+await msg.edit_text(format_message(code), parse_mode=“Markdown”, disable_web_page_preview=True)
+
+async def cmd_setfav(update: Update, context: ContextTypes.DEFAULT_TYPE):
+if not context.args:
+await update.message.reply_text(“Usage: `/setfav MO`\n\nUse /lines to see all codes.”, parse_mode=“Markdown”)
+return
+code = context.args[0].upper()
+if code not in LINE_CODES:
+await update.message.reply_text(f”❓ Unknown line `{code}`. Use /lines.”, parse_mode=“Markdown”)
+return
+set_user(update.effective_user.id, {“favourite”: code})
+await update.message.reply_text(
+f”✅ Favourite saved: *{LINE_CODES[code]}* (`{code}`)\n\nNow use `/myfav` anytime to get live departures.”,
+parse_mode=“Markdown”,
+)
+
+async def cmd_myfav(update: Update, context: ContextTypes.DEFAULT_TYPE):
+user = get_user(update.effective_user.id)
+fav = user.get(“favourite”)
+if not fav:
+await update.message.reply_text(“You haven’t saved a favourite line yet.\n\nUse `/setfav MO` to save one.”, parse_mode=“Markdown”)
+return
+msg = await update.message.reply_text(f”🔄 Fetching {LINE_CODES[fav]} departures…”)
+await msg.edit_text(format_message(fav), parse_mode=“Markdown”, disable_web_page_preview=True)
+
+async def cmd_setalert(update: Update, context: ContextTypes.DEFAULT_TYPE):
+“”“Usage: /setalert MO 08:00”””
+if len(context.args) < 2:
+await update.message.reply_text(
+“Usage: `/setalert MO 08:00`\n\nThis sends you daily departures at that time.”,
+parse_mode=“Markdown”,
+)
+return
+
+```
+code = context.args[0].upper()
+time_str = context.args[1]
+
+if code not in LINE_CODES:
+    await update.message.reply_text(f"❓ Unknown line `{code}`. Use /lines.", parse_mode="Markdown")
+    return
+
+try:
+    alert_time = datetime.strptime(time_str, "%H:%M").time()
+except ValueError:
+    await update.message.reply_text("❌ Invalid time format. Use HH:MM, e.g. `08:00`", parse_mode="Markdown")
+    return
+
+user_id = update.effective_user.id
+chat_id = update.effective_chat.id
+job_name = f"alert_{user_id}"
+
+# Remove existing job if any
+current_jobs = context.job_queue.get_jobs_by_name(job_name)
+for job in current_jobs:
+    job.schedule_removal()
+
+# Schedule new daily job
+context.job_queue.run_daily(
+    send_alert,
+    time=alert_time,
+    name=job_name,
+    data={"user_id": user_id, "chat_id": chat_id, "line_code": code},
+)
+
+# Save to user profile
+set_user(user_id, {"alert_line": code, "alert_time": time_str, "alert_chat": chat_id})
+
+await update.message.reply_text(
+    f"⏰ *Daily alert set!*\n\n"
+    f"Line: *{LINE_CODES[code]}* (`{code}`)\n"
+    f"Time: *{time_str}* every day\n\n"
+    f"Use `/cancelalert` to stop it.",
+    parse_mode="Markdown",
+)
+```
+
+async def cmd_cancelalert(update: Update, context: ContextTypes.DEFAULT_TYPE):
+user_id = update.effective_user.id
+job_name = f”alert_{user_id}”
+jobs = context.job_queue.get_jobs_by_name(job_name)
+if not jobs:
+await update.message.reply_text(“You don’t have an active alert.”)
+return
+for job in jobs:
+job.schedule_removal()
+set_user(user_id, {“alert_line”: None, “alert_time”: None})
+await update.message.reply_text(“✅ Daily alert cancelled.”)
+
+async def cmd_mystatus(update: Update, context: ContextTypes.DEFAULT_TYPE):
+user = get_user(update.effective_user.id)
+fav  = user.get(“favourite”)
+alert_line = user.get(“alert_line”)
+alert_time = user.get(“alert_time”)
+
+```
+fav_str   = f"`{fav}` — {LINE_CODES.get(fav, '?')}" if fav else "_Not set_"
+alert_str = f"`{alert_line}` at *{alert_time}* daily" if alert_line and alert_time else "_Not set_"
+
+await update.message.reply_text(
+    f"*Your GO Train Bot settings:*\n\n"
+    f"⭐ Favourite line: {fav_str}\n"
+    f"⏰ Daily alert: {alert_str}\n\n"
+    f"Change with `/setfav` or `/setalert`",
+    parse_mode="Markdown",
+)
+```
+
+# ── Inline Query ──────────────────────────────────────────────────────────────
 
 async def inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
 query = update.inline_query.query.strip().upper()
@@ -130,71 +289,34 @@ results = []
 
 ```
 if query and query not in LINE_CODES:
-    results.append(
-        InlineQueryResultArticle(
-            id=str(uuid4()),
-            title="❓ Unknown line code",
-            description=f"'{query}' not found. Try: MO LW LE ST RH BR KI",
-            input_message_content=InputTextMessageContent(
-                f"Unknown GO Train line `{query}`.\nValid codes: `{'` `'.join(LINE_CODES)}`",
-                parse_mode="Markdown",
-            ),
-        )
-    )
+    results.append(InlineQueryResultArticle(
+        id=str(uuid4()),
+        title="❓ Unknown line code",
+        description=f"Try: {' '.join(LINE_CODES.keys())}",
+        input_message_content=InputTextMessageContent(
+            f"Unknown line `{query}`.\nValid codes: `{'` `'.join(LINE_CODES)}`",
+            parse_mode="Markdown",
+        ),
+    ))
     await update.inline_query.answer(results, cache_time=5)
     return
 
 lines_to_show = {query: LINE_CODES[query]} if query else LINE_CODES
 
 for code, name in lines_to_show.items():
-    message_text = format_message(code)
-    results.append(
-        InlineQueryResultArticle(
-            id=str(uuid4()),
-            title=f"🚂 {name}  ({code})",
-            description="Tap to share live departures from Union Station",
-            input_message_content=InputTextMessageContent(
-                message_text,
-                parse_mode="Markdown",
-                disable_web_page_preview=True,
-            ),
-        )
-    )
+    results.append(InlineQueryResultArticle(
+        id=str(uuid4()),
+        title=f"🚂 {name}  ({code})",
+        description="Tap to share live Union Station departures",
+        input_message_content=InputTextMessageContent(
+            format_message(code),
+            parse_mode="Markdown",
+            disable_web_page_preview=True,
+        ),
+    ))
 
 await update.inline_query.answer(results, cache_time=30)
 ```
-
-# ── Commands ──────────────────────────────────────────────────────────────────
-
-async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-bot_username = context.bot.username
-msg = (
-“👋 *GO Train Departures Bot*\n\n”
-“Use me *in any Telegram chat* — no need to add me!\n\n”
-“Just type in any chat input box:\n”
-f”`@{bot_username} MO` → Milton line\n”
-f”`@{bot_username} LE` → Lakeshore East\n”
-f”`@{bot_username}`   → Browse all lines\n\n”
-“*Available line codes:*\n”
-+ “\n”.join(f”  `{k}` — {v}” for k, v in LINE_CODES.items())
-+ “\n\nData from [GO Tracker](https://www.gotracker.ca) · Real-time ✅”
-)
-await update.message.reply_text(msg, parse_mode=“Markdown”, disable_web_page_preview=True)
-
-async def cmd_go(update: Update, context: ContextTypes.DEFAULT_TYPE):
-code = (context.args[0].upper() if context.args else “MO”)
-if code not in LINE_CODES:
-await update.message.reply_text(
-f”Unknown line `{code}`. Valid: `{'` `'.join(LINE_CODES)}`”,
-parse_mode=“Markdown”
-)
-return
-await update.message.reply_text(“🔄 Fetching…”)
-await update.message.reply_text(
-format_message(code),
-parse_mode=“Markdown”,
-disable_web_page_preview=True
-)
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
@@ -206,12 +328,19 @@ sys.exit(1)
 
 ```
 app = ApplicationBuilder().token(token).build()
-app.add_handler(InlineQueryHandler(inline_query))
-app.add_handler(CommandHandler("start", cmd_start))
-app.add_handler(CommandHandler("help", cmd_start))
-app.add_handler(CommandHandler("go", cmd_go))
 
-logger.info("✅ Inline bot running!")
+app.add_handler(InlineQueryHandler(inline_query))
+app.add_handler(CommandHandler("start",       cmd_start))
+app.add_handler(CommandHandler("help",        cmd_help))
+app.add_handler(CommandHandler("lines",       cmd_lines))
+app.add_handler(CommandHandler("go",          cmd_go))
+app.add_handler(CommandHandler("setfav",      cmd_setfav))
+app.add_handler(CommandHandler("myfav",       cmd_myfav))
+app.add_handler(CommandHandler("setalert",    cmd_setalert))
+app.add_handler(CommandHandler("cancelalert", cmd_cancelalert))
+app.add_handler(CommandHandler("mystatus",    cmd_mystatus))
+
+logger.info("✅ Bot running — personal + inline mode active")
 app.run_polling(allowed_updates=["message", "inline_query"])
 ```
 
