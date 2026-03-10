@@ -1,16 +1,21 @@
 """
-GO Train Telegram Bot
-=====================
-Uses Playwright (headless Chromium) to render gotracker.ca — a JavaScript React app
-that cannot be scraped with plain requests/BeautifulSoup.
+GO Train Telegram Bot — Kitchener Line
+=======================================
+Uses the gotracker.ca real-time signage API:
+  GET https://www.gotracker.ca/gotracker/mobile/proxy/web/Messages/Signage/Rail/{LINE}/{STATION}
 
-Two modes per station:
-  - /from <station>  →  StationDeparture  (station → Union)
-  - /to <station>    →  UnionDeparture    (Union → station)
+Kitchener line stations (west → east), codes verified from live API:
+  Kitchener (KI) → Guelph Central (GL) → Acton (AC) → Georgetown (GE) →
+  Mount Pleasant (MO) → Brampton Innovation District GO (BR) → Bramalea (BE) →
+  Malton (MA) → Weston (WE) → Mount Dennis (MD) → Bloor (BL) → Union (UN)
+
+Commands:
+  /from <station>   — next trains FROM that station → Union  (Inbound)
+  /to <station>     — next trains FROM Union → that station  (Outbound)
+  /stations         — list all supported stations
 
 Install deps:
-  pip install python-telegram-bot playwright flask
-  playwright install chromium
+  pip install python-telegram-bot flask requests
 """
 
 import os
@@ -18,11 +23,13 @@ import sys
 import logging
 import threading
 import asyncio
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime
 
+import requests
 from flask import Flask
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
-from playwright.async_api import async_playwright
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -38,7 +45,7 @@ flask_app = Flask(__name__)
 
 @flask_app.route("/")
 def home():
-    return "GO Train Bot Running"
+    return "GO Train Bot (Kitchener Line) Running ✅"
 
 def run_web():
     port = int(os.environ.get("PORT", 10000))
@@ -46,319 +53,284 @@ def run_web():
     flask_app.run(host="0.0.0.0", port=port, use_reloader=False)
 
 
-# ── Station config ────────────────────────────────────────────────────────────
-# Maps user-friendly name → GO Tracker station code (used in URL)
-STATIONS = {
-    "union":           "UN",
-    "mountpleasant":   "MP",
-    "brampton":        "BR",
-    "bramalea":        "BM",
-    "georgetown":      "GE",
-    "acton":           "AC",
-    "guelph":          "GU",
-    "kitchener":       "KI",
-    "milton":          "MI",
-    "oakville":        "OA",
-    "burlington":      "BU",
-    "hamilton":        "HA",
-    "westharbour":     "WR",
-    "niagarafalls":    "NF",
-    "oshawa":          "OS",
-    "whitby":          "WH",
-    "ajax":            "AJ",
-    "pickering":       "PI",
-    "rougehill":       "RO",
-    "scarborough":     "SC",
-    "eglinton":        "EG",
-    "agincourt":       "AG",
-    "milliken":        "MK",
-    "unionville":      "UV",
-    "centennial":      "CE",
-    "markham":         "MR",
-    "mountjoy":        "MJ",
-    "stouffville":     "ST",
-    "aurora":          "AU",
-    "newmarket":       "NE",
-    "bradford":        "BD",
-    "innisfil":        "IN",
-    "barriesouth":     "BS",
-    "allandale":       "AL",
-    "bloor":           "BL",
-    "weston":          "WE",
-    "etobicokenorth":  "ET",
-    "malton":          "MA",
-}
+# ── Station Config ────────────────────────────────────────────────────────────
+# Codes verified directly from live gotracker API stopsList responses.
+# Ordered west → east.
+STATIONS_ORDERED = [
+    ("kitchener",     "KI", "Kitchener"),
+    ("guelphcentral", "GL", "Guelph Central"),
+    ("acton",         "AC", "Acton"),
+    ("georgetown",    "GE", "Georgetown"),
+    ("mountpleasant", "MO", "Mount Pleasant"),
+    ("brampton",      "BR", "Brampton Innovation District GO"),
+    ("bramalea",      "BE", "Bramalea"),
+    ("malton",        "MA", "Malton"),
+    ("weston",        "WE", "Weston"),
+    ("mountdennis",   "MD", "Mount Dennis"),
+    ("bloor",         "BL", "Bloor"),
+    ("union",         "UN", "Union"),
+]
 
-# Short aliases → canonical name
+# canonical → (code, display_name)
+STATIONS = {name: (code, display) for name, code, display in STATIONS_ORDERED}
+
+# Aliases → canonical name
 ALIASES = {
-    "mp":     "mountpleasant",
-    "mount":  "mountpleasant",
-    "bram":   "bramalea",
-    "geo":    "georgetown",
-    "kit":    "kitchener",
-    "mil":    "milton",
-    "oak":    "oakville",
-    "burl":   "burlington",
-    "ham":    "hamilton",
-    "osh":    "oshawa",
-    "whi":    "whitby",
-    "pick":   "pickering",
-    "scar":   "scarborough",
-    "mark":   "markham",
-    "stou":   "stouffville",
-    "aur":    "aurora",
-    "new":    "newmarket",
-    "brad":   "bradford",
-    "bar":    "barriesouth",
-    "barrie": "barriesouth",
+    # Kitchener
+    "ki":                 "kitchener",
+    "kit":                "kitchener",
+    # Guelph
+    "guelph":             "guelphcentral",
+    "gl":                 "guelphcentral",
+    "gue":                "guelphcentral",
+    # Acton
+    "ac":                 "acton",
+    # Georgetown
+    "geo":                "georgetown",
+    "ge":                 "georgetown",
+    # Mount Pleasant
+    "mp":                 "mountpleasant",
+    "mo":                 "mountpleasant",
+    "mount":              "mountpleasant",
+    "pleasant":           "mountpleasant",
+    # Brampton
+    "br":                 "brampton",
+    "bra":                "brampton",
+    "bramptoninnovation": "brampton",
+    # Bramalea
+    "be":                 "bramalea",
+    "bram":               "bramalea",
+    "bml":                "bramalea",
+    # Malton
+    "ma":                 "malton",
+    "mal":                "malton",
+    # Weston
+    "we":                 "weston",
+    # Mount Dennis
+    "md":                 "mountdennis",
+    "dennis":             "mountdennis",
+    # Bloor
+    "bl":                 "bloor",
+    # Union
+    "un":                 "union",
+    "unionstation":       "union",
 }
 
-BASE_URL = "https://www.gotracker.ca/gotracker/mobile"
+LINE_CODE = "GT"   # Kitchener line identifier on gotracker
+BASE_URL  = "https://www.gotracker.ca/gotracker/mobile/proxy/web/Messages/Signage/Rail"
+
+HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
+        "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 "
+        "Mobile/15E148 Safari/604.1"
+    ),
+    "Accept": "application/json",
+}
 
 
-# ── Playwright scraper ────────────────────────────────────────────────────────
-async def scrape_page(url: str) -> list[dict]:
+# ── API Fetcher ───────────────────────────────────────────────────────────────
+def fetch_departures(station_code: str, direction: str) -> list[dict]:
     """
-    Renders the gotracker.ca React page with a real headless browser.
-    Uses two strategies:
-      1. Intercept the internal JSON API call the React app makes.
-      2. Fall back to parsing the rendered DOM table/list.
+    Fetches real-time departure data from the gotracker signage API.
+
+    direction: "from" → filter Inbound trips  (station → Union)
+               "to"   → filter Outbound trips (Union → station)
+
+    Returns list of dicts with trip details.
     """
-    trips = []
-    intercepted = {}
+    url = f"{BASE_URL}/{LINE_CODE}/{station_code}"
+    logger.info(f"[API] GET {url}")
 
-    async with async_playwright() as pw:
-        browser = await pw.chromium.launch(headless=True)
-        context = await browser.new_context(
-            user_agent=(
-                "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
-                "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 "
-                "Mobile/15E148 Safari/604.1"
-            ),
-            viewport={"width": 390, "height": 844},
-        )
-        page = await context.new_page()
+    resp = requests.get(url, headers=HEADERS, timeout=15)
+    resp.raise_for_status()
+    data = resp.json()
 
-        # Strategy 1 — intercept JSON responses from the app's backend API
-        async def on_response(resp):
-            try:
-                ct = resp.headers.get("content-type", "")
-                if "json" in ct:
-                    url_lower = resp.url.lower()
-                    if any(k in url_lower for k in ("depart", "trip", "service", "stop", "station")):
-                        data = await resp.json()
-                        logger.info(f"[Intercept] {resp.url}")
-                        intercepted.setdefault("calls", []).append(data)
-            except Exception:
-                pass
-
-        page.on("response", on_response)
-
-        logger.info(f"[Playwright] → {url}")
-        try:
-            await page.goto(url, wait_until="networkidle", timeout=30_000)
-        except Exception as e:
-            logger.warning(f"[Playwright] Navigation warning (continuing): {e}")
-
-        # Extra wait for React rendering
-        await page.wait_for_timeout(2500)
-
-        # ── Parse intercepted JSON ────────────────────────────────────────────
-        for data in intercepted.get("calls", []):
-            trips = _extract_from_json(data)
-            if trips:
-                logger.info(f"[Strategy 1] Got {len(trips)} trips from JSON")
-                await browser.close()
-                return trips
-
-        # ── Parse rendered DOM ────────────────────────────────────────────────
-        logger.info("[Strategy 2] Parsing rendered DOM")
-
-        # Try <table> rows first
-        rows = await page.query_selector_all("tr")
-        for row in rows:
-            cells = await row.query_selector_all("td")
-            if len(cells) >= 2:
-                texts = [await c.inner_text() for c in cells]
-                time_val = next((t.strip() for t in texts if _looks_like_time(t)), "")
-                if time_val:
-                    trips.append({
-                        "time":     time_val,
-                        "dest":     texts[1].strip() if len(texts) > 1 else "",
-                        "platform": texts[2].strip() if len(texts) > 2 else "—",
-                        "status":   texts[3].strip() if len(texts) > 3 else "",
-                    })
-
-        if not trips:
-            # Try common React list/card selectors
-            for selector in ["[class*='trip']", "[class*='departure']", "[class*='card']", "li"]:
-                els = await page.query_selector_all(selector)
-                for el in els:
-                    txt = (await el.inner_text()).strip()
-                    lines = [l.strip() for l in txt.splitlines() if l.strip()]
-                    time_val = next((l for l in lines if _looks_like_time(l)), "")
-                    if time_val:
-                        trips.append({
-                            "time":     time_val,
-                            "dest":     lines[1] if len(lines) > 1 else "",
-                            "platform": lines[2] if len(lines) > 2 else "—",
-                            "status":   lines[3] if len(lines) > 3 else "",
-                        })
-                if trips:
-                    break
-
-        logger.info(f"[Strategy 2] Got {len(trips)} trips from DOM")
-        await browser.close()
-
-    return trips
-
-
-def _looks_like_time(s: str) -> bool:
-    """Returns True if the string looks like HH:MM or H:MM."""
-    s = s.strip()
-    if len(s) < 4 or len(s) > 8:
-        return False
-    return ":" in s and s.replace(":", "").replace(" ", "").replace("AM", "").replace("PM", "").isdigit()
-
-
-def _extract_from_json(obj, _depth=0) -> list[dict]:
-    """Recursively walk JSON looking for departure-like objects."""
-    if _depth > 10:
+    if data.get("errCode", 0) != 0:
+        logger.warning(f"[API] Error in response: {data.get('errMsg')}")
         return []
+
+    target_direction = "Inbound" if direction == "from" else "Outbound"
     trips = []
-    if isinstance(obj, list):
-        for item in obj:
-            trips.extend(_extract_from_json(item, _depth + 1))
-    elif isinstance(obj, dict):
-        lower_keys = {k.lower(): k for k in obj}
-        time_key = next((lower_keys[k] for k in lower_keys if "time" in k or "depart" in k or "sched" in k), None)
-        if time_key:
-            dest_key = next((lower_keys[k] for k in lower_keys if "dest" in k or "to" in k or "name" in k), None)
-            plat_key = next((lower_keys[k] for k in lower_keys if "plat" in k or "track" in k), None)
-            stat_key = next((lower_keys[k] for k in lower_keys if "status" in k or "delay" in k or "actual" in k), None)
+
+    for dir_block in data.get("directions", []):
+        if dir_block.get("direction") != target_direction:
+            continue
+
+        for trip in dir_block.get("tripMessages", []):
+            scheduled_raw = trip.get("scheduled", "")
+            actual_raw    = trip.get("actual", "")
+
+            scheduled_dt = _parse_dt(scheduled_raw)
+            actual_dt    = _parse_dt(actual_raw)
+
+            # Compute delay
+            delay_str = ""
+            if scheduled_dt and actual_dt:
+                delta_secs = (actual_dt - scheduled_dt).total_seconds()
+                if delta_secs > 60:
+                    delay_str = f"+{int(delta_secs // 60)} min late"
+                elif delta_secs < -60:
+                    delay_str = f"{int(delta_secs // 60)} min early"
+                else:
+                    delay_str = "On time"
+
+            sched_str = scheduled_dt.strftime("%-I:%M %p") if scheduled_dt else scheduled_raw
+            actual_str = actual_dt.strftime("%-I:%M %p")   if actual_dt    else actual_raw
+
+            stops = [s["stopName"] for s in trip.get("stopsList", []) if s.get("stopName")]
+
             trips.append({
-                "time":     str(obj.get(time_key, "")),
-                "dest":     str(obj.get(dest_key, "")) if dest_key else "",
-                "platform": str(obj.get(plat_key, "—")) if plat_key else "—",
-                "status":   str(obj.get(stat_key, "")) if stat_key else "",
+                "scheduled":   sched_str,
+                "actual":      actual_str,
+                "destination": trip.get("destination", ""),
+                "track":       trip.get("track", "—"),
+                "trip":        trip.get("tripName", ""),
+                "coaches":     trip.get("coachCount", ""),
+                "delay":       delay_str,
+                "is_express":  trip.get("isExpress", False),
+                "stops":       stops,
             })
-        else:
-            for v in obj.values():
-                trips.extend(_extract_from_json(v, _depth + 1))
+
     return trips
 
 
-def fetch_sync(station_code: str, direction: str) -> list[dict]:
-    """
-    Blocking wrapper around the async scraper.
-    direction: "from" → StationDeparture (station → Union)
-               "to"   → UnionDeparture   (Union → station)
-    """
-    endpoint = "StationDeparture" if direction == "from" else "UnionDeparture"
-    url = f"{BASE_URL}/{endpoint}/GT/{station_code}"
-    return asyncio.run(scrape_page(url))
+def _parse_dt(s: str):
+    if not s:
+        return None
+    try:
+        return datetime.fromisoformat(s)
+    except Exception:
+        return None
 
 
 # ── Station resolver ──────────────────────────────────────────────────────────
 def resolve(raw: str):
-    """Return (canonical_name, code) or (None, None)."""
-    name = raw.lower().strip().replace(" ", "").replace("-", "")
-    name = ALIASES.get(name, name)
-    code = STATIONS.get(name)
-    if code:
-        return name, code
+    """Return (canonical, code, display) or (None, None, None)."""
+    key = raw.lower().strip().replace(" ", "").replace("-", "").replace("_", "")
+    key = ALIASES.get(key, key)
+    if key in STATIONS:
+        code, display = STATIONS[key]
+        return key, code, display
     # Prefix match
-    matches = [(k, v) for k, v in STATIONS.items() if k.startswith(name)]
+    matches = [(k, *v) for k, v in STATIONS.items() if k.startswith(key)]
     if len(matches) == 1:
         return matches[0]
-    return None, None
+    return None, None, None
 
 
 # ── Message formatter ─────────────────────────────────────────────────────────
-def fmt_status(s: str) -> str:
-    u = s.upper()
-    if not s:             return ""
-    if "ON TIME" in u:    return "✅"
-    if "DELAY"   in u:    return f"⚠️ {s}"
-    if "CANCEL"  in u:    return f"❌ {s}"
-    return s
+def fmt_delay(d: str) -> str:
+    if not d:              return ""
+    if d == "On time":     return "✅ On time"
+    if "late" in d:        return f"⚠️ {d}"
+    if "early" in d:       return f"🔵 {d}"
+    return d
 
 
 def build_reply(trips: list[dict], title: str) -> str:
     if not trips:
-        return "😕 No departures found right now."
+        return (
+            "😕 No upcoming departures found.\n"
+            "_No trains currently scheduled, or service has ended for today._"
+        )
+
     lines = [f"🚆 *{title}*\n"]
-    for t in trips[:8]:
-        st   = fmt_status(t.get("status", ""))
-        plat = t.get("platform", "—")
-        dest = t.get("dest", "")
-        time = t.get("time", "")
-        row  = f"`{time}` → *{dest}*  🚉 {plat}"
-        if st:
-            row += f"  {st}"
+    for t in trips[:6]:
+        express_tag = "  🚀 _Express_" if t["is_express"] else ""
+        delay_tag   = f"  {fmt_delay(t['delay'])}" if t["delay"] else ""
+        coaches_tag = f"  🚃 {t['coaches']} cars" if t["coaches"] else ""
+
+        row = f"`{t['scheduled']}` — Track *{t['track']}*{delay_tag}{coaches_tag}{express_tag}"
+        if t["destination"]:
+            row += f"\n  └ ➡️ *{t['destination']}*"
+        if t["stops"] and len(t["stops"]) > 1:
+            row += f"\n  └ 🛑 {' → '.join(t['stops'])}"
+
         lines.append(row)
-    return "\n".join(lines)
+
+    return "\n\n".join(lines)
 
 
 # ── Telegram commands ─────────────────────────────────────────────────────────
+HELP_TEXT = (
+    "🚆 *GO Train Bot — Kitchener Line*\n\n"
+    "Commands:\n"
+    "  `/from <station>` — trains FROM station eastbound to Union\n"
+    "  `/to <station>` — trains FROM Union westbound to station\n"
+    "  `/stations` — list all supported stations\n\n"
+    "Examples:\n"
+    "  `/from mountpleasant`  or  `/from mp`\n"
+    "  `/to georgetown`       or  `/to geo`\n"
+    "  `/from kitchener`      or  `/from ki`\n"
+    "  `/to bramalea`         or  `/to bram`"
+)
+
+
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "🚆 *GO Train Bot*\n\n"
-        "Commands:\n"
-        "  `/from <station>` — train FROM station TO Union\n"
-        "  `/to <station>` — train FROM Union TO station\n"
-        "  `/stations` — list all station names\n\n"
-        "Examples:\n"
-        "  `/from mountpleasant`  or  `/from mp`\n"
-        "  `/to mountpleasant`    or  `/to mp`",
-        parse_mode="Markdown",
-    )
+    await update.message.reply_text(HELP_TEXT, parse_mode="Markdown")
 
 
 async def cmd_stations(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    names = sorted(STATIONS.keys())
-    text  = "\n".join(f"  • `{n}`" for n in names)
-    await update.message.reply_text(f"📍 *Stations:*\n\n{text}", parse_mode="Markdown")
+    lines = ["📍 *Kitchener Line Stations* (west → east)\n"]
+    for canonical, code, display in STATIONS_ORDERED:
+        lines.append(f"  `{canonical}` — {display} `[{code}]`")
+    lines.append(
+        "\n_Aliases also work, e.g. `mp`, `geo`, `ki`, `bram`, `guelph`_"
+    )
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+
+executor = ThreadPoolExecutor(max_workers=4)
 
 
 async def _handle(update: Update, context: ContextTypes.DEFAULT_TYPE, direction: str):
     cmd = "from" if direction == "from" else "to"
+
     if not context.args:
         await update.message.reply_text(
-            f"Usage: `/{cmd} <station>`\nExample: `/{cmd} mountpleasant`",
-            parse_mode="Markdown",
-        )
-        return
-
-    canonical, code = resolve(" ".join(context.args))
-    if not code:
-        await update.message.reply_text(
-            f"❓ Unknown station: *{' '.join(context.args)}*\n"
+            f"Usage: `/{cmd} <station>`\nExample: `/{cmd} mountpleasant`\n\n"
             "Send /stations for the full list.",
             parse_mode="Markdown",
         )
         return
 
-    arrow = "→ Union" if direction == "from" else "← from Union"
+    raw_input = " ".join(context.args)
+    canonical, code, display = resolve(raw_input)
+
+    if not code:
+        await update.message.reply_text(
+            f"❓ Unknown station: *{raw_input}*\n\n"
+            "Send /stations for the Kitchener line station list.",
+            parse_mode="Markdown",
+        )
+        return
+
+    arrow = "→ Union 🏙️" if direction == "from" else "← from Union 🏙️"
     await update.message.reply_text(
-        f"⏳ Fetching *{canonical.title()}* {arrow}…",
+        f"⏳ Fetching *{display}* {arrow}",
         parse_mode="Markdown",
     )
 
     try:
         loop = asyncio.get_event_loop()
-        trips = await loop.run_in_executor(None, fetch_sync, code, direction)
+        trips = await loop.run_in_executor(
+            executor, fetch_departures, code, direction
+        )
     except Exception as e:
-        logger.exception("Scraper failed")
+        logger.exception("Fetch failed")
         await update.message.reply_text(f"⚠️ Error fetching data: {e}")
         return
 
     title = (
-        f"{canonical.title()} → Union"
+        f"{display} → Union"
         if direction == "from"
-        else f"Union → {canonical.title()}"
+        else f"Union → {display}"
     )
-    await update.message.reply_text(build_reply(trips, title), parse_mode="Markdown")
+    await update.message.reply_text(
+        build_reply(trips, title),
+        parse_mode="Markdown",
+    )
 
 
 async def cmd_from(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -372,12 +344,13 @@ async def cmd_to(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def run_bot():
     token = os.environ.get("BOT_TOKEN")
     if not token:
-        logger.error("BOT_TOKEN not set")
+        logger.error("BOT_TOKEN environment variable not set")
         sys.exit(1)
 
-    logger.info("Starting Telegram bot")
+    logger.info("Starting GO Train Telegram Bot (Kitchener Line)")
     app = ApplicationBuilder().token(token).build()
     app.add_handler(CommandHandler("start",    cmd_start))
+    app.add_handler(CommandHandler("help",     cmd_start))
     app.add_handler(CommandHandler("stations", cmd_stations))
     app.add_handler(CommandHandler("from",     cmd_from))
     app.add_handler(CommandHandler("to",       cmd_to))
