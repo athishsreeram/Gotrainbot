@@ -1,4 +1,5 @@
-python-telegram-bot>=20.0
+flask
+python-telegram-bot
+playwright
+beautifulsoup4
 requests
-beautifulsoup4==4.12.2
-flask==3.0.2
